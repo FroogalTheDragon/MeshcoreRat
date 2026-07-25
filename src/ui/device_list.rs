@@ -7,7 +7,7 @@ pub fn draw_device_list(
     f: &mut Frame<'_>,
     area: Rect,
     devices: &[(String, String)],
-    selected: &ListState,
+    selected: &mut ListState,
     logs: &[String],
     connection_status: Option<&str>,
 ) {
@@ -29,10 +29,9 @@ pub fn draw_device_list(
         .block(Block::default().title("Devices").borders(Borders::ALL))
         .highlight_style(Style::default().fg(Color::Black).bg(Color::LightGreen).add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ");
-    let mut state = selected.clone();
-    f.render_stateful_widget(device_list, chunks[0], &mut state);
+    f.render_stateful_widget(device_list, chunks[0], selected);
 
-    let mut right_chunks = if connection_status.is_some() {
+    let right_chunks = if connection_status.is_some() {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())

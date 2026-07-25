@@ -1,5 +1,5 @@
 use bluer::agent::Agent;
-use bluer::{AdapterEvent, Address, AddressType, Session, Uuid};
+use bluer::{AdapterEvent, Address, AddressType, Session};
 use futures::StreamExt;
 use std::error::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -25,8 +25,7 @@ pub async fn run(
     // 1. Set up the Bluetooth Agent to handle PIN requests
     let (prompt_tx, mut prompt_rx) = mpsc::channel::<AgentRequest>(8);
 
-    let mut agent = Agent::default();
-    agent.request_default = true;
+    let mut agent = Agent { request_default: true, ..Default::default() };
 
     // Define what happens when a device asks for a PIN - send a request to the dispatcher
     let pin_tx = prompt_tx.clone();
@@ -36,10 +35,10 @@ pub async fn run(
             let prompt = format!("Device {:?} is requesting a PIN.", req);
             let (resp_tx, resp_rx) = oneshot::channel();
             // If dispatcher is alive, send request and await response. Otherwise fallback to blocking read.
-            if pin_tx.send(AgentRequest::Pin(prompt.clone(), resp_tx)).await.is_ok() {
-                if let Ok(pin) = resp_rx.await {
-                    return Ok(pin);
-                }
+            if pin_tx.send(AgentRequest::Pin(prompt.clone(), resp_tx)).await.is_ok()
+                && let Ok(pin) = resp_rx.await
+            {
+                return Ok(pin);
             }
 
             // Fallback: blocking prompt (only used if dispatcher isn't running)
@@ -63,12 +62,11 @@ pub async fn run(
         Box::pin(async move {
             let prompt = format!("Device {:?} is requesting a Passkey (numeric PIN).", req);
             let (resp_tx, resp_rx) = oneshot::channel();
-            if pass_tx.send(AgentRequest::Passkey(prompt.clone(), resp_tx)).await.is_ok() {
-                if let Ok(pass_str) = resp_rx.await {
-                    if let Ok(pk) = pass_str.trim().parse::<u32>() {
-                        return Ok(pk);
-                    }
-                }
+            if pass_tx.send(AgentRequest::Passkey(prompt.clone(), resp_tx)).await.is_ok()
+                && let Ok(pass_str) = resp_rx.await
+                && let Ok(pk) = pass_str.trim().parse::<u32>()
+            {
+                return Ok(pk);
             }
 
             let passkey = tokio::task::spawn_blocking(move || {
@@ -164,12 +162,12 @@ pub async fn run(
                         // attempt to connect
                         if let Ok(device) = adapter_clone.device(addr) {
                             let txc = tx_clone.clone();
-                            let _ = tokio::spawn(async move {
-                                if let Err(e) = attempt_pair_and_connect(device, txc.clone()).await {
-                                    if let Some(tx) = &txc {
-                                        let _ = tx.send(format!("CONN_FAIL:{}", e)).await;
-                                        let _ = tx.send(format!("Connect failed: {}", e)).await;
-                                    }
+                            tokio::spawn(async move {
+                                if let Err(e) = attempt_pair_and_connect(device, txc.clone()).await
+                                    && let Some(tx) = &txc
+                                {
+                                    let _ = tx.send(format!("CONN_FAIL:{}", e)).await;
+                                    let _ = tx.send(format!("Connect failed: {}", e)).await;
                                 }
                             });
                         } else if let Some(tx) = &tx_clone {
@@ -202,7 +200,7 @@ pub async fn run(
                 .await?
                 .unwrap_or_else(|| "Unknown".to_string());
 
-            if !name.starts_with("MeshCore") {
+            if !is_meshcore_name(&name) {
                 continue;
             }
 
@@ -245,54 +243,21 @@ pub async fn run(
     }
 }
 
-// Helper: parse a hex string (possibly containing spaces) into bytes.
-fn parse_hex_input(s: &str) -> Vec<u8> {
-    let filtered: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    let mut out = Vec::new();
-    let mut chars = filtered.chars();
-    while let Some(hi) = chars.next() {
-        if let Some(lo) = chars.next() {
-            let pair = format!("{}{}", hi, lo);
-            if let Ok(b) = u8::from_str_radix(&pair, 16) {
-                out.push(b);
-            }
-        } else {
-            break;
-        }
-    }
-    out
-}
-
-// Helper: determine whether a device name is a MeshCore device
 fn is_meshcore_name(name: &str) -> bool {
-    // MeshCore devices use names that begin with "MeshCore"
     name.starts_with("MeshCore")
 }
 
-// Helper: extract printable ASCII substrings of at least `min_len` from bytes
-fn extract_printable_ascii(data: &[u8], min_len: usize) -> Vec<String> {
-    let mut current = String::new();
-    let mut found = Vec::new();
-    for &b in data {
-        if b >= 32 && b <= 126 {
-            current.push(b as char);
-        } else {
-            if current.len() >= min_len {
-                found.push(current.clone());
-            }
-            current.clear();
-        }
-    }
-    if current.len() >= min_len {
-        found.push(current);
-    }
-    found
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn build_start_packet(app_name: &str) -> Vec<u8> {
-    let mut data = vec![0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-    data.extend_from_slice(app_name.as_bytes());
-    data
+    #[test]
+    fn test_is_meshcore_name() {
+        assert!(is_meshcore_name("MeshCore-1234"));
+        assert!(is_meshcore_name("MeshCore Node"));
+        assert!(!is_meshcore_name("OtherDevice"));
+        assert!(!is_meshcore_name("meshcore-lowercase"));
+    }
 }
 
 async fn attempt_pair_and_connect(device: Device, ui_tx: Option<Sender<String>>) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -356,13 +321,13 @@ async fn attempt_pair_and_connect(device: Device, ui_tx: Option<Sender<String>>)
         tokio::spawn(async move {
             tokio::pin!(notify);
             while let Some(data) = notify.next().await {
-                if let Ok(text) = String::from_utf8(data.clone()) {
-                    if text.chars().all(|c| !c.is_control() || c == '\n' || c == '\r') {
-                        if let Some(uix) = &ui_tx {
-                            let _ = uix.send(format!("RX text: {}", text)).await;
-                        }
-                        continue;
+                if let Ok(text) = String::from_utf8(data.clone())
+                    && text.chars().all(|c| !c.is_control() || c == '\n' || c == '\r')
+                {
+                    if let Some(uix) = &ui_tx {
+                        let _ = uix.send(format!("RX text: {}", text)).await;
                     }
+                    continue;
                 }
                 if let Some(uix) = &ui_tx {
                     let mut s = String::from("RX binary: ");
@@ -378,51 +343,4 @@ async fn attempt_pair_and_connect(device: Device, ui_tx: Option<Sender<String>>)
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_hex_input() {
-        assert_eq!(parse_hex_input("01 FF"), vec![0x01, 0xFF]);
-        assert_eq!(parse_hex_input("0A0B0C"), vec![0x0A, 0x0B, 0x0C]);
-        assert_eq!(parse_hex_input("A B C"), vec![0xAB]);
-        assert_eq!(parse_hex_input(""), Vec::<u8>::new());
-    }
-
-    #[test]
-    fn test_extract_printable_ascii() {
-        let data = b"Hello\x00World!!!\x01abcde";
-        let found = extract_printable_ascii(data, 3);
-        assert!(found.contains(&"Hello".to_string()));
-        assert!(found.contains(&"World!!!".to_string()));
-        assert!(found.contains(&"abcde".to_string()));
-    }
-
-    #[test]
-    fn test_build_start_packet() {
-        let pkt = build_start_packet("RustTest");
-        assert_eq!(pkt[0], 0x01);
-        assert_eq!(&pkt[8..], b"RustTest");
-    }
-
-    #[test]
-    fn test_is_meshcore_name() {
-        assert!(is_meshcore_name("MeshCore-1234"));
-        assert!(is_meshcore_name("MeshCore Node"));
-        assert!(!is_meshcore_name("OtherDevice"));
-        assert!(!is_meshcore_name("meshcore-lowercase"));
-    }
-
-    #[test]
-    fn test_parse_hex_input_edgecases() {
-        // lowercase hex
-        assert_eq!(parse_hex_input("0a 0b"), vec![0x0A, 0x0B]);
-        // odd number of hex digits -> last nibble ignored
-        assert_eq!(parse_hex_input("ABC"), vec![0xAB]);
-        // invalid characters ignored
-        assert_eq!(parse_hex_input("GG 01"), vec![0x01]);
-    }
 }

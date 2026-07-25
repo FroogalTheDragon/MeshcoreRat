@@ -94,7 +94,7 @@ pub async fn run(
         terminal.draw(|f| {
             let size = f.area();
             match &mode {
-                UiMode::DeviceList => draw_device_list(f, size, &devices, &selected, &logs, connection_status.as_deref()),
+                UiMode::DeviceList => draw_device_list(f, size, &devices, &mut selected, &logs, connection_status.as_deref()),
                 UiMode::PinEntry { addr, name, input, button } => {
                     draw_pin_entry(f, size, addr, name, input, *button);
                 }
@@ -111,29 +111,25 @@ pub async fn run(
                             terminal.show_cursor()?;
                             return Ok(());
                         }
-                        KeyCode::Down => {
-                            if !devices.is_empty() {
-                                let next = selected.selected().unwrap_or(0).saturating_add(1);
-                                let next = next.min(devices.len() - 1);
-                                selected.select(Some(next));
-                            }
+                        KeyCode::Down if !devices.is_empty() => {
+                            let next = selected.selected().unwrap_or(0).saturating_add(1);
+                            let next = next.min(devices.len() - 1);
+                            selected.select(Some(next));
                         }
-                        KeyCode::Up => {
-                            if !devices.is_empty() {
-                                let next = selected.selected().unwrap_or(0).saturating_sub(1);
-                                selected.select(Some(next));
-                            }
+                        KeyCode::Up if !devices.is_empty() => {
+                            let next = selected.selected().unwrap_or(0).saturating_sub(1);
+                            selected.select(Some(next));
                         }
                         KeyCode::Enter => {
-                            if let Some(index) = selected.selected() {
-                                if let Some((addr, name)) = devices.get(index) {
-                                    mode = UiMode::PinEntry {
-                                        addr: addr.clone(),
-                                        name: name.clone(),
-                                        input: String::new(),
-                                        button: PinButton::Continue,
-                                    };
-                                }
+                            if let Some(index) = selected.selected()
+                                && let Some((addr, name)) = devices.get(index)
+                            {
+                                mode = UiMode::PinEntry {
+                                    addr: addr.clone(),
+                                    name: name.clone(),
+                                    input: String::new(),
+                                    button: PinButton::Continue,
+                                };
                             }
                         }
                         _ => {}
@@ -178,10 +174,8 @@ pub async fn run(
                                 }
                             }
                         }
-                        KeyCode::Char(c) => {
-                            if !c.is_control() && input.len() < 32 {
-                                input.push(c);
-                            }
+                        KeyCode::Char(c) if !c.is_control() && input.len() < 32 => {
+                            input.push(c);
                         }
                         _ => {}
                     },
