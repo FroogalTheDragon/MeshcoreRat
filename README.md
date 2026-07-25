@@ -46,8 +46,10 @@ Notes:
 ## Usage (TUI)
 
 - The TUI currently displays two panes: a status/controls pane and a scrolling
-	log of events. Keybindings:
-	- `q`: quit the UI
+  log of events. Keybindings:
+  - `Up` / `Down`: move selection between discovered devices
+  - `Enter`: select the highlighted MeshCore device and prompt for PIN/passkey
+  - `q`: quit the UI
 
 The TUI is a work-in-progress. CLI-style commands (for sending NUS packets)
 still route through the stdin dispatcher; future iterations will add input
@@ -55,7 +57,8 @@ widgets to the TUI for composing and sending binary packets.
 
 ## Testing
 
-Unit tests for parsing and helper functions are included. Run:
+A small unit test covers MeshCore name detection and ensures device discovery
+filtering behaves as expected. Run:
 
 ```bash
 cargo test
