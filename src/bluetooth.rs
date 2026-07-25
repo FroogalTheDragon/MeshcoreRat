@@ -1,11 +1,12 @@
 use bluer::agent::Agent;
-use bluer::{AdapterEvent, Address, Session};
+use bluer::{AdapterEvent, Address, AddressType, Session, Uuid};
 use futures::StreamExt;
 use std::error::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
-use std::collections::VecDeque;
+use std::collections::HashSet;
 use tracing::{debug, info, warn};
+use bluer::Device;
 
 #[derive(Debug)]
 pub enum AgentRequest {
@@ -13,11 +14,16 @@ pub enum AgentRequest {
     Passkey(String, oneshot::Sender<String>),
 }
 
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Sender, Receiver};
 
-pub async fn run(session: Session, ui_tx: Option<Sender<String>>) -> Result<(), Box<dyn Error>> {
+pub async fn run(
+    session: Session,
+    ui_tx: Option<Sender<String>>,
+    mut cmd_rx: Option<Receiver<String>>,
+    mut prompt_resp_rx: Option<Receiver<String>>,
+) -> Result<(), Box<dyn Error>> {
     // 1. Set up the Bluetooth Agent to handle PIN requests
-    let (prompt_tx, prompt_rx) = mpsc::channel::<AgentRequest>(8);
+    let (prompt_tx, mut prompt_rx) = mpsc::channel::<AgentRequest>(8);
 
     let mut agent = Agent::default();
     agent.request_default = true;
@@ -86,6 +92,33 @@ pub async fn run(session: Session, ui_tx: Option<Sender<String>>) -> Result<(), 
         let _ = tx.send("Bluetooth Agent registered.".to_string()).await;
     }
 
+    // If a prompt response channel was provided, spawn a task to forward agent prompts to UI
+    if let Some(mut prx) = prompt_resp_rx.take() {
+        let tx_clone = ui_tx.clone();
+        tokio::spawn(async move {
+            while let Some(req) = prompt_rx.recv().await {
+                match req {
+                    AgentRequest::Pin(prompt, responder) => {
+                        if let Some(tx) = &tx_clone {
+                            let _ = tx.send(format!("PROMPT:{}", prompt)).await;
+                        }
+                        if let Some(resp) = prx.recv().await {
+                            let _ = responder.send(resp);
+                        }
+                    }
+                    AgentRequest::Passkey(prompt, responder) => {
+                        if let Some(tx) = &tx_clone {
+                            let _ = tx.send(format!("PROMPT:{}", prompt)).await;
+                        }
+                        if let Some(resp) = prx.recv().await {
+                            let _ = responder.send(resp);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // 2. Initialize Adapter
     // Try to obtain the default adapter, retrying a few times rather than failing immediately.
     let adapter = loop {
@@ -113,12 +146,53 @@ pub async fn run(session: Session, ui_tx: Option<Sender<String>>) -> Result<(), 
 
     info!("Scanning for devices using {}...", adapter.name());
     if let Some(tx) = &ui_tx {
-        let _ = tx.send(format!("Scanning on adapter {}", adapter.name())).await;
+        let _ = tx.send(format!("STATUS:Scanning on adapter {}", adapter.name())).await;
+    }
+
+    // If a command channel was provided, spawn a task to handle commands (requires adapter)
+    if let Some(mut rx) = cmd_rx.take() {
+        let tx_clone = ui_tx.clone();
+        let adapter_clone = adapter.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                if cmd.starts_with("connect ") {
+                    let addr_str = cmd.trim_start_matches("connect ").trim();
+                    if let Ok(addr) = addr_str.parse::<Address>() {
+                        if let Some(tx) = &tx_clone {
+                            let _ = tx.send(format!("UI requested connect to {}", addr)).await;
+                        }
+                        // attempt to connect
+                        if let Ok(device) = adapter_clone.device(addr) {
+                            let txc = tx_clone.clone();
+                            let _ = tokio::spawn(async move {
+                                if let Err(e) = attempt_pair_and_connect(device, txc.clone()).await {
+                                    if let Some(tx) = &txc {
+                                        let _ = tx.send(format!("CONN_FAIL:{}", e)).await;
+                                        let _ = tx.send(format!("Connect failed: {}", e)).await;
+                                    }
+                                }
+                            });
+                        } else if let Some(tx) = &tx_clone {
+                            let _ = tx.send(format!("CONN_FAIL:Device {} not found on adapter", addr)).await;
+                            let _ = tx.send(format!("Device {} not found on adapter", addr)).await;
+                        }
+                    } else if let Some(tx) = &tx_clone {
+                        let _ = tx.send(format!("CONN_FAIL:Invalid address: {}", addr_str)).await;
+                        let _ = tx.send(format!("Invalid address: {}", addr_str)).await;
+                    }
+                } else {
+                    if let Some(tx) = &tx_clone {
+                        let _ = tx.send(format!("Received UI command: {}", cmd)).await;
+                    }
+                }
+            }
+        });
     }
 
     // 3. Start discovering devices
     let mut discover_events = adapter.discover_devices().await?;
     let mut target_addr: Option<Address> = None;
+    let mut seen_meshcore_devices: HashSet<(AddressType, String, Option<Vec<String>>)> = HashSet::new();
 
     while let Some(event) = discover_events.next().await {
         if let AdapterEvent::DeviceAdded(addr) = event {
@@ -128,263 +202,47 @@ pub async fn run(session: Session, ui_tx: Option<Sender<String>>) -> Result<(), 
                 .await?
                 .unwrap_or_else(|| "Unknown".to_string());
 
-            debug!("Discovered device {} ({})", name, addr);
-            if let Some(tx) = &ui_tx {
-                let _ = tx.send(format!("Discovered device {} ({})", name, addr)).await;
+            if !name.starts_with("MeshCore") {
+                continue;
             }
 
-            if name == "MeshCore-🐲Froogal" {
+            let address_type = device.address_type().await.unwrap_or_default();
+            let uuids = device
+                .uuids()
+                .await
+                .ok()
+                .flatten()
+                .map(|set| {
+                    let mut list = set.into_iter().map(|u| u.to_string()).collect::<Vec<String>>();
+                    list.sort();
+                    list
+                });
+
+            let fingerprint = (address_type, name.clone(), uuids.clone());
+            if !seen_meshcore_devices.insert(fingerprint) {
+                debug!("Ignoring duplicate MeshCore device {} ({})", name, addr);
+                continue;
+            }
+
+            debug!("Discovered device {} ({}) type={:?} uuids={:?}", name, addr, address_type, uuids);
+            if let Some(tx) = &ui_tx {
+                let _ = tx.send(format!("DEVICE:{}|{}", addr, name)).await;
+                let _ = tx.send(format!("LOG:Discovered device {} ({})", name, addr)).await;
+            }
+
+            if target_addr.is_none() {
                 target_addr = Some(addr);
-                break;
             }
         }
     }
 
-    // 4. Pair and Connect
     // Drop the discovery stream to ensure the adapter stops scanning
     drop(discover_events);
 
-    if let Some(addr) = target_addr {
-        let device = adapter.device(addr)?;
-
-        info!("Found device {}. Waiting 4 seconds for BlueZ background queries to settle...", addr);
-        if let Some(tx) = &ui_tx {
-            let _ = tx.send(format!("Found device {}", addr)).await;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-
-        if !device.is_paired().await? {
-            info!("Pairing with {}... (Agent will automatically provide PIN)", addr);
-            let _ = device.set_trusted(true).await;
-
-            let mut attempts = 1;
-            loop {
-                match device.pair().await {
-                    Ok(_) => {
-                        info!("Successfully paired after {} attempts!", attempts);
-                        if let Some(tx) = &ui_tx {
-                            let _ = tx.send(format!("Paired after {} attempts", attempts)).await;
-                        }
-                        break;
-                    }
-                    Err(e) => {
-                        warn!("Pairing attempt {} failed: {}", attempts, e);
-                        if let Some(tx) = &ui_tx {
-                            let _ = tx.send(format!("Pairing attempt {} failed: {}", attempts, e)).await;
-                        }
-                        attempts += 1;
-                        // Keep trying indefinitely
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    }
-                }
-            }
-        }
-
-        info!("Connecting via BLE GATT...");
-        device.connect().await?;
-
-        info!("Connected! Searching for Nordic UART Service (NUS)...");
-
-        // Wait a moment for GATT services to be resolved
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-        let mut tx_char = None;
-        let mut rx_char = None;
-
-        for service in device.services().await? {
-            let uuid = service.uuid().await?;
-            // Nordic UART Service UUID
-            if uuid.to_string().to_uppercase() == "6E400001-B5A3-F393-E0A9-E50E24DCCA9E" {
-                info!("Found Nordic UART Service!");
-
-                for charac in service.characteristics().await? {
-                    let cuuid = charac.uuid().await?;
-                    if cuuid.to_string().to_uppercase() == "6E400002-B5A3-F393-E0A9-E50E24DCCA9E" {
-                        info!("Found RX Characteristic (App -> Device)");
-                        rx_char = Some(charac);
-                    } else if cuuid.to_string().to_uppercase()
-                        == "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
-                    {
-                        info!("Found TX Characteristic (Device -> App)");
-                        tx_char = Some(charac);
-                    }
-                }
-            }
-        }
-
-        if let (Some(rx), Some(tx)) = (rx_char, tx_char) {
-                info!("Subscribing to TX notifications...");
-                if let Some(tx) = &ui_tx {
-                    let _ = tx.send("Subscribing to TX notifications".to_string()).await;
-                }
-            let notify = tx.notify().await?;
-
-            println!("=====================================================");
-            println!("  BLE BINARY / SERIAL TERMINAL OPEN");
-            println!("  MeshCore uses a binary protocol: [Packet Type (1 byte)] [Data...]");
-            println!("  Type '/hex 01 FF' to send raw binary bytes, or regular text to send ASCII.");
-            println!("  Press Ctrl+C to exit.");
-            println!("=====================================================");
-
-            // Task 1: Read from device and print to stdout
-            let read_task = tokio::spawn(async move {
-                tokio::pin!(notify);
-                while let Some(data) = notify.next().await {
-                    // Try to print as text if it's perfectly valid UTF-8
-                    if let Ok(text) = String::from_utf8(data.clone()) {
-                        if text
-                            .chars()
-                            .all(|c| !c.is_control() || c == '\n' || c == '\r')
-                        {
-                            print!("{}", text);
-                            use std::io::Write;
-                            let _ = std::io::stdout().flush();
-                            if let Some(tx) = &ui_tx {
-                                let _ = tx.send(format!("RX text: {}", text)).await;
-                            }
-                            continue;
-                        }
-                    }
-
-                    // Otherwise print as a hex array since it's a binary protocol
-                    print!("Received (binary): ");
-                    for b in &data {
-                        print!("{:02X} ", b);
-                    }
-                    println!();
-                    if let Some(tx) = &ui_tx {
-                        let mut s = String::from("RX binary: ");
-                        for b in &data { s.push_str(&format!("{:02X} ", b)); }
-                        let _ = tx.send(s).await;
-                    }
-
-                    // Extract and print any hidden ASCII text inside the binary payload
-                    let mut current_string = String::new();
-                    let mut found_strings = Vec::new();
-                    for &b in &data {
-                        // Check if it's a printable ASCII character
-                        if b >= 32 && b <= 126 {
-                            current_string.push(b as char);
-                        } else {
-                            // If we hit a non-printable byte, save the string if it's long enough
-                            if current_string.len() >= 4 {
-                                found_strings.push(current_string.clone());
-                            }
-                            current_string.clear();
-                        }
-                    }
-                    if current_string.len() >= 4 {
-                        found_strings.push(current_string);
-                    }
-
-                    if !found_strings.is_empty() {
-                        println!("  -> Decoded Text: {:?}", found_strings);
-                        if let Some(tx) = &ui_tx {
-                            let _ = tx.send(format!("Decoded Text: {:?}", found_strings)).await;
-                        }
-                    }
-                }
-            });
-
-            // Single stdin dispatcher + write task
-            let (user_tx, mut user_rx) = mpsc::channel::<String>(32);
-
-            // Dispatcher: handles incoming Agent prompt requests and stdin lines,
-            // routing stdin to either the prompt responder (if a prompt is pending)
-            // or to the user input channel for the write task.
-            let mut prompt_rx = prompt_rx; // take ownership
-            let dispatcher = tokio::spawn(async move {
-                use tokio::io::AsyncBufReadExt;
-
-                let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-                let mut pending_prompts: VecDeque<AgentRequest> = VecDeque::new();
-
-                loop {
-                    tokio::select! {
-                        maybe_req = prompt_rx.recv() => {
-                            match maybe_req {
-                                Some(req) => {
-                                    match &req {
-                                        AgentRequest::Pin(prompt, _) | AgentRequest::Passkey(prompt, _) => {
-                                            // Show the prompt so user knows why input is requested
-                                            println!("{}", prompt);
-                                        }
-                                    }
-                                    pending_prompts.push_back(req);
-                                }
-                                None => break,
-                            }
-                        }
-                        line = lines.next_line() => {
-                            match line {
-                                Ok(Some(l)) => {
-                                    if let Some(req) = pending_prompts.pop_front() {
-                                        match req {
-                                            AgentRequest::Pin(_, responder) | AgentRequest::Passkey(_, responder) => {
-                                                let _ = responder.send(l);
-                                            }
-                                        }
-                                    } else {
-                                        if user_tx.send(l).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                }
-                                Ok(None) => break,
-                                Err(_) => break,
-                            }
-                        }
-                    }
-                }
-            });
-
-            // Write task: consumes user-entered lines routed by the dispatcher
-            let write_task = tokio::spawn(async move {
-                while let Some(line) = user_rx.recv().await {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-
-                    let mut data_to_send = Vec::new();
-
-                    if trimmed == "start" {
-                        println!("Sending CMD_APP_START...");
-                        data_to_send = vec![0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-                        data_to_send.extend_from_slice(b"RustTest");
-                    } else if trimmed == "query" {
-                        println!("Sending CMD_DEVICE_QUERY...");
-                        data_to_send = vec![0x16, 0x03];
-                    } else if trimmed.starts_with("/hex ") {
-                        let hex_str = trimmed.strip_prefix("/hex ").unwrap().replace(" ", "");
-                        for i in (0..hex_str.len()).step_by(2) {
-                            if i + 2 <= hex_str.len() {
-                                if let Ok(byte) = u8::from_str_radix(&hex_str[i..i + 2], 16) {
-                                    data_to_send.push(byte);
-                                }
-                            }
-                        }
-                        println!("Sending raw binary: {:?}", data_to_send);
-                    } else {
-                        data_to_send = format!("{}\r\n", trimmed).into_bytes();
-                    }
-
-                    if let Err(e) = rx.write(&data_to_send).await {
-                        println!("Failed to send: {}", e);
-                    }
-                }
-            });
-
-            // Run read + dispatcher + write tasks
-            let _ = tokio::try_join!(read_task, dispatcher, write_task);
-        } else {
-            warn!("Could not find both RX and TX characteristics on this device.");
-        }
-    } else {
-        info!("Target device was not found.");
+    // Keep the bluetooth task alive to respond to UI commands and prompts
+    loop {
+        tokio::time::sleep(Duration::from_secs(60)).await;
     }
-
-    Ok(())
 }
 
 // Helper: parse a hex string (possibly containing spaces) into bytes.
@@ -403,6 +261,12 @@ fn parse_hex_input(s: &str) -> Vec<u8> {
         }
     }
     out
+}
+
+// Helper: determine whether a device name is a MeshCore device
+fn is_meshcore_name(name: &str) -> bool {
+    // MeshCore devices use names that begin with "MeshCore"
+    name.starts_with("MeshCore")
 }
 
 // Helper: extract printable ASCII substrings of at least `min_len` from bytes
@@ -431,6 +295,91 @@ fn build_start_packet(app_name: &str) -> Vec<u8> {
     data
 }
 
+async fn attempt_pair_and_connect(device: Device, ui_tx: Option<Sender<String>>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let addr = device.address();
+    if let Some(tx) = &ui_tx {
+        let _ = tx.send(format!("Attempting pair/connect to {}", addr)).await;
+    }
+
+    if !device.is_paired().await? {
+        let _ = device.set_trusted(true).await;
+        let mut attempts = 1;
+        loop {
+            match device.pair().await {
+                Ok(_) => {
+                    if let Some(tx) = &ui_tx {
+                        let _ = tx.send(format!("Paired {} after {} attempts", addr, attempts)).await;
+                    }
+                    break;
+                }
+                Err(e) => {
+                    if let Some(tx) = &ui_tx {
+                        let _ = tx.send(format!("Pairing attempt {} failed: {}", attempts, e)).await;
+                    }
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+    }
+
+    device.connect().await?;
+    if let Some(tx) = &ui_tx {
+        let _ = tx.send(format!("CONN:Connected to {}", addr)).await;
+        let _ = tx.send(format!("Connected to {}", addr)).await;
+    }
+
+    // Wait for GATT
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let mut tx_char = None;
+    let mut rx_char = None;
+    for service in device.services().await? {
+        let uuid = service.uuid().await?;
+        if uuid.to_string().to_uppercase() == "6E400001-B5A3-F393-E0A9-E50E24DCCA9E" {
+            for charac in service.characteristics().await? {
+                let cuuid = charac.uuid().await?;
+                if cuuid.to_string().to_uppercase() == "6E400002-B5A3-F393-E0A9-E50E24DCCA9E" {
+                    rx_char = Some(charac);
+                } else if cuuid.to_string().to_uppercase() == "6E400003-B5A3-F393-E0A9-E50E24DCCA9E" {
+                    tx_char = Some(charac);
+                }
+            }
+        }
+    }
+
+    if let (Some(_rx), Some(tx)) = (rx_char, tx_char) {
+        if let Some(uix) = &ui_tx {
+            let _ = uix.send("Subscribing to TX notifications (connected)".to_string()).await;
+        }
+        let notify = tx.notify().await?;
+        tokio::spawn(async move {
+            tokio::pin!(notify);
+            while let Some(data) = notify.next().await {
+                if let Ok(text) = String::from_utf8(data.clone()) {
+                    if text.chars().all(|c| !c.is_control() || c == '\n' || c == '\r') {
+                        if let Some(uix) = &ui_tx {
+                            let _ = uix.send(format!("RX text: {}", text)).await;
+                        }
+                        continue;
+                    }
+                }
+                if let Some(uix) = &ui_tx {
+                    let mut s = String::from("RX binary: ");
+                    for b in &data { s.push_str(&format!("{:02X} ", b)); }
+                    let _ = uix.send(s).await;
+                }
+            }
+        });
+    } else {
+        if let Some(tx) = &ui_tx {
+            let _ = tx.send("Could not find both RX and TX characteristics on this device.".to_string()).await;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,5 +406,23 @@ mod tests {
         let pkt = build_start_packet("RustTest");
         assert_eq!(pkt[0], 0x01);
         assert_eq!(&pkt[8..], b"RustTest");
+    }
+
+    #[test]
+    fn test_is_meshcore_name() {
+        assert!(is_meshcore_name("MeshCore-1234"));
+        assert!(is_meshcore_name("MeshCore Node"));
+        assert!(!is_meshcore_name("OtherDevice"));
+        assert!(!is_meshcore_name("meshcore-lowercase"));
+    }
+
+    #[test]
+    fn test_parse_hex_input_edgecases() {
+        // lowercase hex
+        assert_eq!(parse_hex_input("0a 0b"), vec![0x0A, 0x0B]);
+        // odd number of hex digits -> last nibble ignored
+        assert_eq!(parse_hex_input("ABC"), vec![0xAB]);
+        // invalid characters ignored
+        assert_eq!(parse_hex_input("GG 01"), vec![0x01]);
     }
 }
