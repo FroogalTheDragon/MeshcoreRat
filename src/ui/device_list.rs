@@ -7,7 +7,7 @@ use std::collections::HashMap;
 pub fn draw_device_list(
     f: &mut Frame<'_>,
     area: Rect,
-    devices: &[(String, String)], // (addr, name)
+    devices: &[(String, String, String)], // (addr, raw_name, display_name)
     selected: &mut ListState,
     logs: &[String],
     connection_map: &HashMap<String, String>,
@@ -22,9 +22,9 @@ pub fn draw_device_list(
     } else {
         devices
             .iter()
-            .map(|(addr, name)| {
+            .map(|(addr, _raw_name, display_name)| {
                 let status = connection_map.get(addr).map(|s| format!(" [{}]", s)).unwrap_or_default();
-                ListItem::new(format!("{} ({}){}", name, addr, status))
+                ListItem::new(format!("{}{}", display_name, status))
             })
             .collect()
     };
@@ -45,7 +45,7 @@ pub fn draw_device_list(
     };
     // Show the selected device connection status
     if let Some(sel) = selected.selected() {
-        if let Some((addr, _name)) = devices.get(sel) {
+        if let Some((addr, _, _)) = devices.get(sel) {
             let status = connection_map.get(addr).map(|s| s.as_str()).unwrap_or("");
             let status_block = Paragraph::new(status)
                 .block(Block::default().title("Connection").borders(Borders::ALL))
