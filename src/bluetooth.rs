@@ -1,5 +1,8 @@
-use bluer::{AdapterEvent, Address, AddressType, Session};
-use futures::StreamExt;
+//! Bluetooth management and connection flow.
+//!
+//! This module drives adapter discovery, refresh handling, pairing, and connection logic.
+
+use bluer::{Address, AddressType, Session};
 use std::error::Error;
 use tokio::time::Duration;
 use std::collections::HashSet;
@@ -53,64 +56,68 @@ pub async fn run(
 
     // We'll handle UI commands inline below (so we can use scanner/connection modules)
 
-    // 3. Start discovering devices
-    let mut discover_events = adapter.discover_devices().await?;
+    // 3. Start discovering devices using the shared scanner helper
     let mut target_addr: Option<Address> = None;
     let mut seen_meshcore_devices: HashSet<(AddressType, String, Option<Vec<String>>)> = HashSet::new();
 
-    while let Some(event) = discover_events.next().await {
-        if let AdapterEvent::DeviceAdded(addr) = event {
-            let device = adapter.device(addr)?;
-            let name = device
-                .name()
-                .await?
-                .unwrap_or_else(|| "Unknown".to_string());
+    let devices = scanner::scan_meshcore_devices(&adapter, Duration::from_secs(5)).await?;
+    for (addr, name) in devices {
+        let device = adapter.device(addr)?;
+        let address_type = device.address_type().await.unwrap_or_default();
+        let uuids = device
+            .uuids()
+            .await
+            .ok()
+            .flatten()
+            .map(|set| {
+                let mut list = set.into_iter().map(|u| u.to_string()).collect::<Vec<String>>();
+                list.sort();
+                list
+            });
 
-            if !is_meshcore_name(&name) {
-                debug!("Not meshcore device, {}", &name);
-                continue;
-            }
+        let fingerprint = (address_type, name.clone(), uuids.clone());
+        if !seen_meshcore_devices.insert(fingerprint) {
+            debug!("Ignoring duplicate MeshCore device {} ({})", name, addr);
+            continue;
+        }
 
-            let address_type = device.address_type().await.unwrap_or_default();
-            let uuids = device
-                .uuids()
-                .await
-                .ok()
-                .flatten()
-                .map(|set| {
-                    let mut list = set.into_iter().map(|u| u.to_string()).collect::<Vec<String>>();
-                    list.sort();
-                    list
-                });
+        debug!("Discovered device {} ({}) type={:?} uuids={:?}", name, addr, address_type, uuids);
+        if let Some(tx) = &ui_tx {
+            let _ = tx.send(format!("DEVICE:{}|{}", addr, name)).await;
+            let _ = tx.send(format!("LOG:Discovered device {} ({})", name, addr)).await;
+        }
 
-            let fingerprint = (address_type, name.clone(), uuids.clone());
-            if !seen_meshcore_devices.insert(fingerprint) {
-                debug!("Ignoring duplicate MeshCore device {} ({})", name, addr);
-                continue;
-            }
-
-            debug!("Discovered device {} ({}) type={:?} uuids={:?}", name, addr, address_type, uuids);
-            if let Some(tx) = &ui_tx {
-                let _ = tx.send(format!("DEVICE:{}|{}", addr, name)).await;
-                let _ = tx.send(format!("LOG:Discovered device {} ({})", name, addr)).await;
-            }
-
-            if target_addr.is_none() {
-                target_addr = Some(addr);
-            }
+        if target_addr.is_none() {
+            target_addr = Some(addr);
         }
     }
-
-    // Drop the initial discovery stream now that we sent initial DEVICE messages
-    drop(discover_events);
 
     // Command loop: respond to refresh/connect requests from UI
     let mut cmd_rx = cmd_rx.take().expect("command channel required");
     while let Some(cmd) = cmd_rx.recv().await {
         if cmd == "refresh" {
-            // run a short scan and forward discovered devices
+            // run a short scan and forward only newly discovered MeshCore devices
             let devices = scanner::scan_meshcore_devices(&adapter, Duration::from_secs(5)).await?;
             for (addr, name) in devices {
+                let device = adapter.device(addr)?;
+                let address_type = device.address_type().await.unwrap_or_default();
+                let uuids = device
+                    .uuids()
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|set| {
+                        let mut list = set.into_iter().map(|u| u.to_string()).collect::<Vec<String>>();
+                        list.sort();
+                        list
+                    });
+
+                let fingerprint = (address_type, name.clone(), uuids.clone());
+                if !seen_meshcore_devices.insert(fingerprint) {
+                    debug!("Skipping duplicate refresh MeshCore device {} ({})", name, addr);
+                    continue;
+                }
+
                 if let Some(tx) = &ui_tx {
                     let _ = tx.send(format!("DEVICE:{}|{}", addr, name)).await;
                 }
@@ -171,21 +178,4 @@ pub async fn run(
     }
 
     Ok(())
-
-}
-fn is_meshcore_name(name: &str) -> bool {
-    name.starts_with("MeshCore")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_is_meshcore_name() {
-        assert!(is_meshcore_name("MeshCore-1234"));
-        assert!(is_meshcore_name("MeshCore Node"));
-        assert!(!is_meshcore_name("OtherDevice"));
-        assert!(!is_meshcore_name("meshcore-lowercase"));
-    }
 }

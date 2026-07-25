@@ -5,6 +5,20 @@ use std::error::Error;
 use tokio::time::Duration;
 use tracing::debug;
 
+#[allow(dead_code)]
+pub fn is_meshcore_name(name: &str) -> bool {
+    name.starts_with("MeshCore")
+}
+
+#[allow(dead_code)]
+pub fn normalize_uuids(uuids: Option<Vec<String>>) -> Option<Vec<String>> {
+    uuids.map(|mut list| {
+        list.sort();
+        list.dedup();
+        list
+    })
+}
+
 /// Scan for MeshCore devices for the given duration and return `(Address, name)` pairs.
 /// Keeps deduplication simple using address type, name and sorted UUID list.
 pub async fn scan_meshcore_devices(
@@ -26,17 +40,16 @@ pub async fn scan_meshcore_devices(
                     Some(AdapterEvent::DeviceAdded(addr)) => {
                         if let Ok(device) = adapter.device(addr) {
                             let name = device.name().await?.unwrap_or_else(|| "Unknown".to_string());
-                            if !name.starts_with("MeshCore") {
+                            if !is_meshcore_name(&name) {
                                 debug!("Skipping non-meshcore device {}", name);
                                 continue;
                             }
 
                             let address_type = device.address_type().await.unwrap_or_default();
-                            let uuids = device.uuids().await.ok().flatten().map(|set|{
-                                let mut list = set.into_iter().map(|u| u.to_string()).collect::<Vec<String>>();
-                                list.sort();
-                                list
+                            let uuids = device.uuids().await.ok().flatten().map(|set| {
+                                set.into_iter().map(|u| u.to_string()).collect::<Vec<String>>()
                             });
+                            let uuids = normalize_uuids(uuids);
 
                             let fingerprint = (address_type, name.clone(), uuids.clone());
                             if !seen.insert(fingerprint) {
