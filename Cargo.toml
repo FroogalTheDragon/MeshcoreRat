@@ -1,0 +1,13 @@
+[package]
+name = "meshy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bluer = { version = "0.17.4", features = ["full"] }
+futures = "0.3.33"
+ratatui = "0.30.2"
+crossterm = "0.29"
+tokio = { version = "1.53.1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
