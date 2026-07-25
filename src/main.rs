@@ -36,6 +36,5 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
 
     let _ = tokio::try_join!(ui_handle, bt_handle);
-
     Ok(())
 }

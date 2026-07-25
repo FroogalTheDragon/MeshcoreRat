@@ -5,6 +5,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use ratatui::widgets::ListState;
 use std::io::{self, Write};
 use tokio::sync::mpsc::{Receiver, Sender};
+use std::collections::HashMap;
 use tokio::time::{self, Duration};
 
 mod device_list;
@@ -21,6 +22,10 @@ enum UiMode {
         name: String,
         input: String,
         button: PinButton,
+    },
+    Confirm {
+        addr: String,
+        name: String,
     },
 }
 
@@ -39,7 +44,7 @@ pub async fn run(
     let mut selected = ListState::default();
     selected.select(Some(0));
     let mut mode = UiMode::DeviceList;
-    let mut connection_status: Option<String> = None;
+    let mut connection_map: HashMap<String, String> = HashMap::new();
     let mut logs: Vec<String> = Vec::new();
     let mut tick = time::interval(Duration::from_millis(200));
 
@@ -60,20 +65,49 @@ pub async fn run(
                         } else if let Some(device) = s.strip_prefix("DEVICE:") {
                             let mut parts = device.splitn(2, '|');
                             if let (Some(addr), Some(name)) = (parts.next(), parts.next()) {
-                                if !devices.iter().any(|(a, _)| a == addr) {
-                                    devices.push((addr.to_string(), name.to_string()));
-                                    logs.push(format!("Added device {} ({})", name, addr));
-                                }
+                                    if !devices.iter().any(|(a, _)| a == addr) {
+                                        // If the same device name already exists for a different MAC,
+                                        // make the display name unique by appending the MAC.
+                                        let display_name = if devices.iter().any(|(_, n)| n == name) {
+                                            format!("{} ({})", name, addr)
+                                        } else {
+                                            name.to_string()
+                                        };
+
+                                        devices.push((addr.to_string(), display_name.clone()));
+                                        logs.push(format!("Added device {} ({})", display_name, addr));
+                                    }
                                 if selected.selected().is_none() {
                                     selected.select(Some(0));
                                 }
                             }
                         } else if let Some(conn) = s.strip_prefix("CONN:") {
-                            connection_status = Some(conn.to_string());
+                            // e.g. "Connected to <addr>"
+                            if let Some(addr) = conn.trim_start_matches("Connected to ").trim().split_whitespace().next() {
+                                connection_map.insert(addr.to_string(), "Connected".to_string());
+                            }
                             logs.push(conn.to_string());
                         } else if let Some(err) = s.strip_prefix("CONN_FAIL:") {
-                            connection_status = Some(format!("Connection failed: {}", err));
                             logs.push(format!("Connection failed: {}", err));
+                            // try to capture an address where possible
+                            if err.starts_with("Device ") {
+                                if let Some(part) = err.split_whitespace().nth(1) {
+                                    connection_map.insert(part.to_string(), "Connection failed".to_string());
+                                }
+                            }
+                        } else if let Some(d) = s.strip_prefix("DISCONN:") {
+                            // e.g. "Disconnected from <addr>"
+                            if let Some(addr) = d.trim_start_matches("Disconnected from ").trim().split_whitespace().next() {
+                                connection_map.remove(addr);
+                            }
+                            logs.push(d.to_string());
+                        } else if let Some(err) = s.strip_prefix("DISCONN_FAIL:") {
+                            logs.push(format!("Disconnect failed: {}", err));
+                            if err.starts_with("Device ") {
+                                if let Some(part) = err.split_whitespace().nth(1) {
+                                    connection_map.insert(part.to_string(), "Disconnect failed".to_string());
+                                }
+                            }
                         } else if let Some(status) = s.strip_prefix("STATUS:") {
                             logs.push(status.to_string());
                         } else if let Some(log) = s.strip_prefix("LOG:") {
@@ -94,9 +128,23 @@ pub async fn run(
         terminal.draw(|f| {
             let size = f.area();
             match &mode {
-                UiMode::DeviceList => draw_device_list(f, size, &devices, &mut selected, &logs, connection_status.as_deref()),
+                UiMode::DeviceList => draw_device_list(f, size, &devices, &mut selected, &logs, &connection_map),
                 UiMode::PinEntry { addr, name, input, button } => {
                     draw_pin_entry(f, size, addr, name, input, *button);
+                }
+                UiMode::Confirm { addr, name } => {
+                    // draw underlying device list
+                    draw_device_list(f, size, &devices, &mut selected, &logs, &connection_map);
+                    // overlay a small centered confirmation box
+                    let area = f.area();
+                    let w = (area.width / 2).max(20);
+                    let h = 5u16;
+                    let x = (area.width.saturating_sub(w)) / 2;
+                    let y = (area.height.saturating_sub(h)) / 2;
+                    let rect = ratatui::layout::Rect::new(x, y, w, h);
+                    let para = ratatui::widgets::Paragraph::new(format!("Disconnect {} ({})? (y/n)", name, addr))
+                        .block(ratatui::widgets::Block::default().title("Confirm").borders(ratatui::widgets::Borders::ALL));
+                    f.render_widget(para, rect);
                 }
             }
         })?;
@@ -105,6 +153,18 @@ pub async fn run(
             if let CEvent::Key(key) = event::read()? {
                 match &mut mode {
                     UiMode::DeviceList => match key.code {
+                        KeyCode::Char('r') | KeyCode::Char('R') => {
+                            println!("Refresh Device List");
+                            let _ = cmd_tx.send("refresh".to_string()).await;
+                            logs.push("Refresh device list requested by user".to_string());
+                        }
+                        KeyCode::Char('d') => {
+                            if let Some(index) = selected.selected()
+                                && let Some((addr, name)) = devices.get(index)
+                            {
+                                mode = UiMode::Confirm { addr: addr.clone(), name: name.clone() };
+                            }
+                        }
                         KeyCode::Char('q') => {
                             disable_raw_mode()?;
                             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -176,6 +236,19 @@ pub async fn run(
                         }
                         KeyCode::Char(c) if !c.is_control() && input.len() < 32 => {
                             input.push(c);
+                        }
+                        _ => {}
+                    },
+                    UiMode::Confirm { addr, name } => match key.code {
+                        KeyCode::Char('y') => {
+                            let cmd = format!("disconnect {}", addr);
+                            let _ = cmd_tx.send(cmd).await;
+                            logs.push(format!("Disconnect confirmed for {} ({})", name, addr));
+                            mode = UiMode::DeviceList;
+                        }
+                        KeyCode::Char('n') | KeyCode::Esc => {
+                            logs.push(format!("Disconnect canceled for {} ({})", name, addr));
+                            mode = UiMode::DeviceList;
                         }
                         _ => {}
                     },
