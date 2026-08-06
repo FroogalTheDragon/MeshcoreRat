@@ -1,4 +1,4 @@
-use meshy::ui::insert_device_display_name;
+use MeshcoreRat::ui::insert_device_display_name;
 
 #[test]
 fn insert_new_device_returns_true() {

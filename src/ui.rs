@@ -271,7 +271,7 @@ pub async fn run(
                                         channels: vec!["public".to_string(), "private".to_string()],
                                         selected_channel: 0,
                                         current_channel: "public".to_string(),
-                                        messages: vec![("system".to_string(), "Welcome to Meshy chat.".to_string())],
+                                        messages: vec![("system".to_string(), "Welcome to MeshcoreRat chat.".to_string())],
                                         input: String::new(),
                                     };
                                 }

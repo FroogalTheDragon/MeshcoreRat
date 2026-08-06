@@ -1,4 +1,4 @@
-use meshy::bluetooth::scanner::{is_meshcore_name, normalize_uuids};
+use MeshcoreRat::bluetooth::scanner::{is_meshcore_name, normalize_uuids};
 
 #[test]
 fn meshcore_name_prefix_matches() {

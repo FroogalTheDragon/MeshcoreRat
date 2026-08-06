@@ -1,6 +1,6 @@
-# meshy
+# MeshcoreRat
 
-meshy is a command-line / terminal UI (TUI) client for MeshCore companion radios.
+MeshcoreRat is a command-line / terminal UI (TUI) client for MeshCore companion radios.
 It connects to devices over Bluetooth Low Energy (BLE) using BlueZ (via the
 `bluer` crate) and provides a Ratatui-based interface for discovery, pairing,
 GATT exploration and sending/receiving packets over the Nordic UART Service
